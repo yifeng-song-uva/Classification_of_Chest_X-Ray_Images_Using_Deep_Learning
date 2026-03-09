@@ -1,0 +1,501 @@
+---
+title: "Classification of Chest X-Ray Using Convolutional Netural networks"
+author:
+  - "Hanjun Ni (whs9hm)"
+  - "Yifeng Song (ys8mz)"
+  - "Grace Zhou (jgg8xd)"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: pdflatex
+    toc: false
+    number_sections: false
+  word_document:
+    toc: false
+fontsize: 12pt
+geometry: margin=1in
+linestretch: 1
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{array}
+  - \usepackage{float}
+  - \usepackage{setspace}
+  - \usepackage{pdflscape}
+  - \usepackage{caption}
+  - \captionsetup[table]{skip=6pt}
+  - \captionsetup[figure]{skip=6pt}
+  - \singlespacing
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.pos = "H",
+  out.width = "88%",
+  dpi = 300,
+  dev = "png"
+)
+
+library(dplyr)
+library(purrr)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(knitr)
+library(ggplot2)
+library(jpeg)
+library(png)
+
+baseDir <- "D:/machine learning/final project/rscbjbr9sj-2/ChestXRay2017/chest_xray"
+
+if(!dir.exists(baseDir)){
+  stop("The folder in baseDir was not found. Please update baseDir to your local chest_xray folder before rendering.")
+}
+
+isWordOutput <- function(){
+  to <- knitr::opts_knit$get("rmarkdown.pandoc.to")
+  if (is.null(to)) return(FALSE)
+  any(grepl("docx", to, fixed = TRUE))
+}
+
+pagebreak <- function(){
+  if (knitr::is_latex_output()) {
+    cat("\n\\newpage\n")
+  } else if (isWordOutput()) {
+    cat("\n\n```{=openxml}\n<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>\n```\n\n")
+  } else {
+    cat("\n\n<div style='page-break-after: always;'></div>\n\n")
+  }
+}
+
+renderTable <- function(df, caption, align = NULL, font_size = 9, longtable = FALSE){
+  if (is.null(align)) {
+    align <- rep("l", ncol(df))
+  }
+
+  if (isWordOutput() && requireNamespace("flextable", quietly = TRUE)) {
+    ft <- flextable::flextable(df)
+    ft <- flextable::set_caption(ft, caption = caption)
+    ft <- flextable::theme_booktabs(ft)
+    ft <- flextable::fontsize(ft, size = font_size, part = "all")
+    ft <- flextable::align(ft, align = "center", part = "all")
+    ft <- flextable::align(ft, j = seq_len(min(2, ncol(df))), align = "left", part = "all")
+    ft <- flextable::autofit(ft)
+    ft <- flextable::set_table_properties(ft, layout = "autofit")
+    return(ft)
+  }
+
+  out <- knitr::kable(
+    df,
+    format = if (knitr::is_latex_output()) "latex" else "pipe",
+    caption = caption,
+    booktabs = knitr::is_latex_output(),
+    longtable = longtable,
+    align = align,
+    linesep = if (knitr::is_latex_output()) "" else NULL
+  )
+
+  if (knitr::is_latex_output() && requireNamespace("kableExtra", quietly = TRUE)) {
+    opts <- if (longtable) c("repeat_header") else c("hold_position", "scale_down")
+    out <- kableExtra::kable_styling(out, latex_options = opts, font_size = font_size)
+  }
+
+  out
+}
+
+getFiles <- function(folder){
+  if(!dir.exists(folder)) return(character(0))
+  list.files(
+    folder,
+    pattern = "\\.(jpeg|jpg|png)$",
+    full.names = TRUE,
+    recursive = TRUE,
+    ignore.case = TRUE
+  )
+}
+
+trainNormal <- getFiles(file.path(baseDir, "train", "NORMAL"))
+trainPneumonia <- getFiles(file.path(baseDir, "train", "PNEUMONIA"))
+testNormal <- getFiles(file.path(baseDir, "test", "NORMAL"))
+testPneumonia <- getFiles(file.path(baseDir, "test", "PNEUMONIA"))
+
+xrayData <- tibble(
+  image_path = c(trainNormal, trainPneumonia, testNormal, testPneumonia)
+) |>
+  mutate(
+    Dataset = case_when(
+      str_detect(image_path, "[/\\\\]train[/\\\\]") ~ "train",
+      str_detect(image_path, "[/\\\\]test[/\\\\]") ~ "test",
+      TRUE ~ "other"
+    ),
+    Sublabel = case_when(
+      str_detect(toupper(image_path), "[/\\\\]NORMAL[/\\\\]") ~ "NORMAL",
+      str_detect(toupper(basename(image_path)), "BACTERIA") ~ "BACTERIA",
+      str_detect(toupper(basename(image_path)), "VIRUS") ~ "VIRUS",
+      TRUE ~ "PNEUMONIA"
+    ),
+    Label = if_else(Sublabel == "NORMAL", "NORMAL", "PNEUMONIA")
+  ) |>
+  filter(Dataset %in% c("train", "test"))
+
+readGrayInfo <- function(path){
+  ext <- tolower(tools::file_ext(path))
+  img <- if(ext %in% c("jpg", "jpeg")) jpeg::readJPEG(path) else png::readPNG(path)
+  d <- dim(img)
+
+  if(length(d) == 2){
+    gray <- img
+    h <- d[1]
+    w <- d[2]
+  } else {
+    if(d[3] >= 3){
+      gray <- 0.2989 * img[, , 1] + 0.5870 * img[, , 2] + 0.1140 * img[, , 3]
+    } else {
+      gray <- img[, , 1]
+    }
+    h <- d[1]
+    w <- d[2]
+  }
+
+  tibble(
+    Width = w,
+    Height = h,
+    Pixels = w * h,
+    Aspect = round(w / h, 2),
+    Mean = mean(gray) * 255,
+    SD = stats::sd(as.numeric(gray)) * 255
+  )
+}
+
+datasetTotal <- xrayData |>
+  count(Dataset, name = "Total")
+
+splitTab <- xrayData |>
+  count(Dataset, name = "Count") |>
+  mutate(Percentage = paste0(round(100 * Count / sum(Count), 2), "%"))
+
+binaryTab <- xrayData |>
+  count(Dataset, Label, name = "Count") |>
+  left_join(datasetTotal, by = "Dataset") |>
+  mutate(Percentage = paste0(round(100 * Count / Total, 2), "%")) |>
+  select(Dataset, Label, Count, Percentage) |>
+  arrange(Dataset, desc(Label))
+
+threeClassTab <- xrayData |>
+  count(Dataset, Sublabel, name = "Count") |>
+  left_join(datasetTotal, by = "Dataset") |>
+  mutate(Percentage = paste0(round(100 * Count / Total, 2), "%")) |>
+  select(Dataset, Sublabel, Count, Percentage) |>
+  mutate(Sublabel = factor(Sublabel, levels = c("NORMAL", "BACTERIA", "VIRUS"))) |>
+  arrange(Dataset, Sublabel)
+
+set.seed(5630)
+sampleN <- min(100, nrow(xrayData))
+imgSample <- xrayData |>
+  slice_sample(n = sampleN) |>
+  mutate(info = map(image_path, readGrayInfo)) |>
+  tidyr::unnest(info)
+
+imgSummary <- imgSample |>
+  group_by(Dataset, Sublabel) |>
+  summarise(
+    Count = n(),
+    `W min` = min(Width),
+    `W mean` = round(mean(Width), 0),
+    `W max` = max(Width),
+    `H min` = min(Height),
+    `H mean` = round(mean(Height), 0),
+    `H max` = max(Height),
+    `Pixels mean` = round(mean(Pixels), 0),
+    `Aspect mean` = round(mean(Aspect), 2),
+    .groups = "drop"
+  ) |>
+  mutate(Sublabel = factor(Sublabel, levels = c("NORMAL", "BACTERIA", "VIRUS"))) |>
+  arrange(Dataset, Sublabel)
+
+table5Tab <- imgSample |>
+  transmute(
+    Dataset = Dataset,
+    Sublabel = Sublabel,
+    X = Width,
+    Y = Height,
+    Pixels = Pixels,
+    `Aspect ratio` = Aspect
+  ) |>
+  arrange(Dataset, Sublabel, X, Y)
+
+testGeomData <- xrayData |>
+  filter(Dataset == "test")
+
+geomN <- min(384, nrow(testGeomData))
+geomSample <- testGeomData |>
+  slice_sample(n = geomN) |>
+  mutate(info = map(image_path, readGrayInfo)) |>
+  tidyr::unnest(info)
+
+fig3Data <- geomSample |>
+  group_by(Sublabel) |>
+  summarise(
+    `Mean width` = round(mean(Width), 0),
+    `Mean aspect ratio` = round(mean(Aspect), 2),
+    .groups = "drop"
+  ) |>
+  mutate(Sublabel = factor(Sublabel, levels = c("BACTERIA", "NORMAL", "VIRUS"))) |>
+  pivot_longer(cols = c(`Mean width`, `Mean aspect ratio`), names_to = "Metric", values_to = "Value")
+```
+
+```{r titlepage-break, results='asis'}
+pagebreak()
+```
+
+## Hanjun Ni(whs9hm), Yifeng Song(ys8mz), Grace Zhou(jgg8xd)
+
+## Background
+
+The dataset used to conduct this research was obtained from Mendeley Data and consists of the chest X-ray dataset collected by Kermany, Zhang, and Goldbaum. The dataset contains large enough images and has been organized into training and validation datasets that would suit image classification class projects. The dataset was created as an adjunct to the research article *Detecting Medical Diagnoses and Treatable Diseases Using Image-Based Deep Learning*.
+
+The primary reasons for collecting all these thousands of images were to create and evaluate deep learning algorithms that can recognize medical diagnoses using automated image analysis and to serve as a large-scale validated source for conducting research in both medical and ophthalmic fields. The collection is also socially valuable because it may contribute to FDA-approved diagnostic devices that allow faster diagnosis of treatable diseases and may improve clinical efficiency and patient outcomes.
+
+It is critical to thoroughly assess the initial data split so that a chest X-ray classifier identifies disease-related image patterns rather than artifacts associated with folder construction, filename rules, image acquisition, or collection procedures. Thus, prior to modelling using a Convolutional Neural Network (CNN), this project performs a statistical review of the dataset. The intent is to assess whether the apparent predictions are driven exclusively by pathology or whether they are also influenced by shortcut learning in the dataset. This distinction matters because a model showing strong predictive accuracy does not necessarily demonstrate clinically meaningful learning. This is especially true when the training and testing splits may contain overlapping patients, mixed image modalities, imbalance in image geometry, and differences in pixel intensity distributions.
+
+## Summary of Data
+
+This dataset is composed of 5,856 chest x-ray images split into a training set of 5,232 samples and a test set of 624 samples (Table 1). The diagnostic label is the key variable of interest in this study, which is categorized as either Normal or Pneumonia. The test dataset consists of 62.50% pneumonia and 37.50% healthy lung chest x-rays. The training data consists of 74.22% pneumonia cases and 25.78% healthy lung chest x-rays (Table 2).
+
+Pneumonia is classified into two groups based upon etiology or cause, either Bacterial Pneumonia or Viral Pneumonia, which is represented by the sublabel. The test dataset contains a total of 38.78% of all x-rays being bacterial pneumonia and 23.72% being viral pneumonia. On the contrary, the training set has a total of 48.51% bacterial pneumonia x-ray samples and 25.71% viral pneumonia samples (Table 3). The test and training dataset show evidence of class imbalance as there are approximately 27% of images labelled Normal and 73% labelled Pneumonia, indicating that for every Normal case, there are approximately 2.7 Pneumonia cases.
+
+Due to the time to generate statistics for 5,856 images was too much, I randomly sampled 100 total images from each category to determine image dimensions by each category. The sampled image information indicates large differences between Normal and Pneumonia cases (Table 4). For test images sampled, the average size (across 50 sample images) of Bacterial Pneumonia x-ray images is less than that of Normal chest x-ray images but Bacterial Pneumonia has a larger average aspect ratio. In the sampled training x-ray images, Normal chest images generally have larger dimensions and more square aspect ratios than do either Bacterial Pneumonia or Viral Pneumonia (both have greater variability in dimensions than do Normal x-ray images). Sampled image-level dimension records used to build this descriptive analysis can be found in Table 5.
+
+Visual inspection of chest x-ray images shows that Normal chest x-rays appear well-defined whereas Pneumonia chest x-rays appear less defined  because of opacities which can hide parts of the lungs and heart. The split of the classes within each group is illustrated (Figure 2). The mean width and aspect ratio for the first 384 sampled geometry audit images in the test group are summarized in Figure 3. The figure illustrates that the geometrical differences between groups in the test group may be used as shortcut indicators, unless the preprocessing of the chest images data is performed with care.
+
+The training dataset is the widest range for variation in image dimension. The average width and height of Bacterial Pneumonia image samples (n=42) ranges from 564 - 1736 pixels in width and 194 - 1736 pixels in height with the average being approximately 940,366 total pixels and has an average aspect ratio of 1.53. In addition, Normal training images (n=24) are the largest in size, averaging 1666 × 1378 pixels for a total of 2.36 million pixels with the most square-like aspect ratio of 1.22. Lastly, Viral Pneumonia training images (n=21) average 1308 × 887 pixels for a total of 1.22 million pixels with an average aspect ratio of 1.54.
+
+In general, Normal images are significantly larger than, and more square in aspect ratio (average 1.22), than are Pneumonia images (which vary much more in size, but remain in aspect ratio ~1.49-1.54). The variance in image size in the training data compared to the test data may provide better generalization to the models to be trained on this data. Hence, the difference in the dimensionality of the images confirms that there will be a necessity to uniformly scale images to the same size, e.g., 224 × 224 pixels, prior to using as an input image to train models.
+
+
+## Potential Problem and Future Plan
+
+In this data analysis of the dataset we have two major issues, class imbalance and inconsistent image sizes that will cause problems when trying to implement a CNN directly; as such they will introduce model bias as well. In the case of pneumonia (pneumonia cases > normal cases), the model is likely to become heavily biased towards the majority class causing the model to have high accuracy for pneumonia detection while still exhibiting poor performance for normal cases. In addition to class imbalance, the sizes of images within the dataset vary but CNNs require their input dimensions to be fixed as well. If we do not take the time to perform appropriate preprocessing like resizing, we can expect our results from the direct modelling to be biased and/or misleading.
+
+In our approach to answer these concerns we will first resize all images to be the same size (consistent dimension) through normalization. Second, the objective of project will be to create a CNN that can classify lung images as healthy lungs and sick lungs. After we first create this binary classifier, the next step is to adapt our model to classify pneumonia into two distinct classifications (i.e., bacteria vs. viral pneumonia). Given the class imbalance issues we will consider a more comprehensive set of performance measures for our evaluation of the models beyond accuracy; these include: precision, sensitivity, specificity, false positive rate (FPR), false negative rate (FNR), and AUC-ROC analysis. The confusion matrix will also be examined in the evaluation process to identify misclassifications, particularly between bacterial and viral pneumonia cases.
+
+For these reasons, future phases of this effort need to focus on three areas of priority: ensure consistent pre-processing methods across all cases; and use similar methods for grouped evaluations. As such, CNN results cannot be construed until after addressing each of these aforementioned issues.
+
+## Reference
+
+Dablain, D., Jacobson, K. N., Bellinger, C. et al. (2024). *Understanding CNN fragility when learning with imbalanced data*. *Machine Learning*, 113, 4785-4810.
+
+Kermany, D., Zhang, K., and Goldbaum, M. (2018). *Large Dataset of Labeled Optical Coherence Tomography (OCT) and Chest X-Ray Images*. Mendeley Data, Version 3. doi:10.17632/rscbjbr9sj.3.
+
+```{r tables-break, results='asis'}
+pagebreak()
+```
+
+## Tables and Figures
+
+## Tables
+
+```{r table1}
+renderTable(
+  splitTab,
+  caption = "Summary of split data.",
+  align = c("l", "r", "r")
+)
+```
+
+```{r table2}
+renderTable(
+  binaryTab,
+  caption = "Summary of Chest X-Ray Types.",
+  align = c("l", "l", "r", "r")
+)
+```
+
+```{r table3}
+renderTable(
+  threeClassTab,
+  caption = " Class Frequency: Normal vs. Bacterial vs. Viral Pneumonia.",
+  align = c("l", "l", "r", "r")
+)
+```
+
+```{r table4}
+renderTable(
+  imgSummary,
+  caption = " Image Dimensions Summary by Category (n = 100).",
+  align = c("l", "l", rep("r", 9)),
+  font_size = 8
+)
+```
+
+```{r table5}
+renderTable(
+  table5Tab,
+  caption = "Image Dimensions Sample (n = 100).",
+  align = c("l", "l", "r", "r", "r", "r"),
+  font_size = 7,
+  longtable = TRUE
+)
+```
+
+```{r fig-section-break, results='asis'}
+pagebreak()
+```
+
+## Figures
+
+```{r fig1, fig.cap="Sample Chest X-Ray Images by Category.", fig.width=7.8, fig.height=6.2}
+if(requireNamespace("magick", quietly = TRUE)){
+  library(magick)
+
+  pickPath <- function(datasetValue, sublabelValue){
+    xrayData |>
+      filter(Dataset == datasetValue, Sublabel == sublabelValue) |>
+      slice(1) |>
+      pull(image_path)
+  }
+
+  prepImage <- function(path, label){
+    image_read(path) |>
+      image_resize("240x240") |>
+      image_extent("240x240", gravity = "center", color = "white") |>
+      image_annotate(label, size = 16, color = "white", boxcolor = "black", location = "+8+8")
+  }
+
+  img1 <- prepImage(pickPath("train", "NORMAL"), "Train Normal")
+  img2 <- prepImage(pickPath("train", "BACTERIA"), "Train Bacteria")
+  img3 <- prepImage(pickPath("train", "VIRUS"), "Train Virus")
+  img4 <- prepImage(pickPath("test", "NORMAL"), "Test Normal")
+  img5 <- prepImage(pickPath("test", "BACTERIA"), "Test Bacteria")
+  img6 <- prepImage(pickPath("test", "VIRUS"), "Test Virus")
+
+  topRow <- image_append(c(img1, img2, img3))
+  bottomRow <- image_append(c(img4, img5, img6))
+  imgGrid <- image_append(c(topRow, bottomRow), stack = TRUE)
+
+  plot(imgGrid)
+} else {
+  plot.new()
+  text(0.5, 0.5, "Install the magick package to generate Figure 1.")
+}
+```
+
+```{r fig2-break, results='asis'}
+pagebreak()
+```
+
+```{r fig2, fig.cap="The distribution of the 3 classes in the training and testing cohorts.", fig.width=7.2, fig.height=5.2}
+plotData2 <- threeClassTab |>
+  mutate(Sublabel = factor(Sublabel, levels = c("NORMAL", "BACTERIA", "VIRUS")))
+
+ggplot(plotData2, aes(x = Dataset, y = Count, fill = Sublabel)) +
+  geom_col(position = "stack", width = 0.6, color = "black") +
+  scale_fill_grey(start = 0.85, end = 0.35) +
+  labs(x = NULL, y = "Count", fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(12, 18, 12, 12)
+  )
+```
+
+```{r fig3-break, results='asis'}
+pagebreak()
+```
+
+```{r fig3, fig.cap="The mean width and mean aspect ratio of the 384 sampled geometry audits were determined for all patients in the test cohort.", fig.width=7.4, fig.height=4.8}
+ggplot(fig3Data, aes(x = Sublabel, y = Value)) +
+  geom_col(fill = "grey65", color = "black", width = 0.62) +
+  facet_wrap(~ Metric, scales = "free_y", nrow = 1) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 10),
+    plot.margin = margin(12, 18, 12, 12)
+  )
+```
+
+```{r appendix-break, results='asis'}
+pagebreak()
+```
+
+## Appendix
+[Classification of Chest X-Ray Images Using Deep Learning GitHub Repository](https://github.com/yifeng-song-uva/Classification_of_Chest_X-Ray_Images_Using_Deep_Learning/tree/main)
+
+A condensed version of the methods used to produce the proposal tables and figures is given in an appendix. The code below retains only the main steps that would be required to reconstruct the audit from the notebooks containing the original data; these main steps consist of those that are necessary for creating the proposal from the original data
+
+## Appendix A. Build image-level data
+
+```{r appendix1, eval=FALSE, echo=TRUE}
+getFiles <- function(folder){
+  list.files(
+    folder,
+    pattern = "\\.(jpeg|jpg|png)$",
+    full.names = TRUE,
+    recursive = TRUE,
+    ignore.case = TRUE
+  )
+}
+
+xrayData <- tibble(
+  image_path = c(trainNormal, trainPneumonia, testNormal, testPneumonia)
+) |>
+  mutate(
+    Dataset = case_when(
+      str_detect(image_path, "[/\\]train[/\\]") ~ "train",
+      str_detect(image_path, "[/\\]test[/\\]") ~ "test",
+      TRUE ~ "other"
+    ),
+    Sublabel = case_when(
+      str_detect(toupper(image_path), "[/\\]NORMAL[/\\]") ~ "NORMAL",
+      str_detect(toupper(basename(image_path)), "BACTERIA") ~ "BACTERIA",
+      str_detect(toupper(basename(image_path)), "VIRUS") ~ "VIRUS",
+      TRUE ~ "PNEUMONIA"
+    ),
+    Label = if_else(Sublabel == "NORMAL", "NORMAL", "PNEUMONIA")
+  )
+```
+
+## Appendix B. Produce the descriptive summary tables
+
+```{r appendix2, eval=FALSE, echo=TRUE}
+splitTab <- xrayData |>
+  count(Dataset, name = "Count") |>
+  mutate(Percentage = paste0(round(100 * Count / sum(Count), 2), "%"))
+
+binaryTab <- xrayData |>
+  count(Dataset, Label, name = "Count") |>
+  left_join(datasetTotal, by = "Dataset") |>
+  mutate(Percentage = paste0(round(100 * Count / Total, 2), "%")) |>
+  select(Dataset, Label, Count, Percentage)
+
+threeClassTab <- xrayData |>
+  count(Dataset, Sublabel, name = "Count") |>
+  left_join(datasetTotal, by = "Dataset") |>
+  mutate(Percentage = paste0(round(100 * Count / Total, 2), "%")) |>
+  select(Dataset, Sublabel, Count, Percentage)
+```
+
+## Appendix C. Draw the figures
+
+```{r appendix3, eval=FALSE, echo=TRUE}
+set.seed(5630)
+sampleN <- min(100, nrow(xrayData))
+imgSample <- xrayData |>
+  slice_sample(n = sampleN) |>
+  mutate(info = map(image_path, readGrayInfo)) |>
+  tidyr::unnest(info)
+
+geomN <- min(384, nrow(testGeomData))
+geomSample <- testGeomData |>
+  slice_sample(n = geomN) |>
+  mutate(info = map(image_path, readGrayInfo)) |>
+  tidyr::unnest(info)
+```
