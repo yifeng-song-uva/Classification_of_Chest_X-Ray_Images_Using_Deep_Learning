@@ -1,0 +1,236 @@
+---
+title: "STAT5630 Final Project -- Image Augmentation"
+author: "Grace Zhou"
+date: "2026-04-13"
+edit_by: "Yifeng Song"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# knitr::opts_knit$set(root.dir = "C:/Users/grace/OneDrive - University of Virginia/STAT5630 Final Project/chest_xray_resized_new")
+knitr::opts_knit$set(root.dir = "C:\\Users\\songy\\Downloads\\UVA STAT 5630 Statistical Machine Learning\\Project\\data\\chest_xray_resized_new")
+knitr::opts_chunk$set(echo = TRUE)
+library(magick)
+library(dplyr)
+```
+
+```{r}
+load_images_from_csv <- function(csv_data, img_column, label_column) {
+  images <- list()
+  labels <- c()
+  for (i in 1:nrow(csv_data)) {
+    img_path <- csv_data[i, img_column]
+    
+    if (file.exists(img_path)) {
+      img <- image_read(img_path)
+      img_array <- as.numeric(image_data(img)) / 255
+      images[[length(images) + 1]] <- img_array
+      label <- csv_data[i, label_column]
+      if(label == "NORMAL") {
+        label_num <- 0
+      } else {
+        label_num <- 1
+      }
+      
+      labels <- c(labels, label_num)
+    }
+    
+    if(i %% 500 == 0) cat("Loaded", i, "/", nrow(csv_data), "images\n")
+  }
+  
+  return(list(images = images, labels = labels))
+}
+
+file_paths <- read.csv("file_paths.csv")
+file_paths$image_path <- gsub("^chest_xray_resized_new/", "", file_paths$image_path)
+
+all_data <- load_images_from_csv(file_paths, "image_path", "label")
+
+recreate_labels <- function(csv_data) {
+  labels <- c()
+  for(i in 1:nrow(csv_data)) {
+    if(csv_data$label[i] == "NORMAL") {
+      labels <- c(labels, 0)
+    } else {
+      labels <- c(labels, 1)
+    }
+  }
+  return(labels)
+}
+
+clean_labels <- recreate_labels(file_paths)
+
+clean_data <- list(
+  images = all_data$images,
+  labels = clean_labels 
+)
+
+train_idx <- which(file_paths$dataset == "train")
+val_idx <- which(file_paths$dataset == "val")
+test_idx <- which(file_paths$dataset == "test")
+
+train_images <- clean_data$images[train_idx]
+train_labels <- clean_data$labels[train_idx]
+val_images <- clean_data$images[val_idx]
+val_labels <- clean_data$labels[val_idx]
+test_images <- clean_data$images[test_idx]
+test_labels <- clean_data$labels[test_idx]
+```
+The training data contained 1,040 normal images for healthy lungs (coded as 0) and 3,144 images for pneumonia lungs (coded as 1), indicating a severe class imbalance issue. To decrease the false positive rate and potentially increase prediction accuracy, image augmentation was applied to achieve class balance. This exposed the model to more diverse features of the dataset to improve predictive performance. Since healthy lungs have clear shapes and edges, the images were slightly rotated with angles ranging from negative 5 to positive 5 degrees. Additionally, to reduce the dependence on raw data features and improve model generalizability, zooming in a randomly picked smaller square area (ranging from 90% to 99% of the original image size) and scaling back to 224×224 were applied to the images. As a result, the normal image count increased from 1,040 to 3,144, achieving a perfectly balanced training set with a 1:1 ratio against the 3,144 pneumonia images, and the total training set expanded from 4,184 to 6,288 images.
+
+```{r}
+# Don't run this!!!! Instead, use balanced_data <- readRDS("../chest_xray_resized_new_2/balanced_data_for_training.rds") instead
+train_normal_paths <- file_paths$image_path[which(file_paths$dataset == "train" & file_paths$label == "NORMAL")]
+
+original_normal <- length(train_normal_paths)
+pneumonia_count <- sum(train_labels == 1)
+need_count <- pneumonia_count - original_normal
+
+cat("Need to create:", need_count, "augmented normal images\n")
+
+if (!dir.exists("../chest_xray_resized_new_2")) dir.create("../chest_xray_resized_new_2")
+if (!dir.exists("../chest_xray_resized_new_2/train")) dir.create("../chest_xray_resized_new_2/train")
+output_dir <- "../chest_xray_resized_new_2/train/NORMAL"
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+rotate <- function(img, d) {
+  # d is the degree of rotation
+  img <- image_rotate(img, d)
+  img_array <- as.integer(image_data(img))
+  eff_size <- which.min(apply(img_array, 1, function(x) sum(x!=255))) - 1 # there're some white margins at the right and bottom after rotation, so we need to determine the effectize square area in which the rotated image is located
+  l1 <- round(eff_size * abs(sin(d/180*pi))) + 1.5
+  l2 <- l1
+  new_size <- eff_size - 2*l1 # determine the square area to crop the rotated image in which no white pixels exist
+  if (d > 0) { # for clockwise rotation
+    img <- image_crop(img, paste0(new_size, "x", new_size, "+", l1-0.5, "+", l2-0.5))
+  } else { # for counterclockwise rotation
+    img <- image_crop(img, paste0(new_size, "x", new_size, "+", l1/2, "+", l2/2))
+  }
+  img <- image_scale(img, "224x224") # enlarge to cropped area to 224 x 224
+  return(img)
+}
+
+zoom_in <- function(img, m) {
+  # m is the size of the square area who want to zoom in
+  l <- 224 - m
+  # (l1,l2) is where we want to place our zoom-in window in terms of (x,y) coordinates (to be randomly selected)
+  l1 <- sample(1:l,1)
+  l2 <- sample(1:l,1)
+  img <- image_crop(img, paste0(m, "x", m, "+", l1, "+", l2))
+  img <- image_scale(img, "224") # after selecting the zoom-in area, we need to enlarge it to 224 x 224
+  return(img)
+}
+
+augment_image <- function(img, type) {
+  switch(type,
+         "rotate" = rotate(img, sample(c(seq(-5,-0.5,0.5),seq(0.5,5,0.5)), 1)), # randomly choose a rotation angle between -5 and 5, in an interval of 0.5
+         "zoom_in" = zoom_in(img, sample(as.integer(224*0.9):223, 1)) # randomly pick a zoom-in window size between 90% and 100%
+  )
+}
+
+# Generate augmented images
+set.seed(5630) # ensure reproducibility of augmented images
+types <- c("rotate", "zoom_in")
+train_images_augmented <- list()
+original_paths_list <- list() # for each generated new image, we want to track its original image
+types_list <- list()
+for(i in 1:need_count) {
+  original_path <- sample(train_normal_paths, 1) # randomly select a NORMAL image from training set
+  img <- image_read(original_path)
+  aug_type <- sample(types, 1) # randomly choose one of the two image augmentation type
+  augmented <- augment_image(img, aug_type)
+  train_images_augmented[[i]] <- augmented
+  original_paths_list[[i]] <- original_path
+  types_list[[i]] <- aug_type # record the type of each augmentation
+  if(i %% 500 == 0) cat("Created", i, "/", need_count, "\n")
+}
+
+# save the augmented images to disk as separate files
+df <- data.frame(original=unlist(original_paths_list), augment_type = unlist(types_list))
+df <- df %>% group_by(original) %>% mutate(n=row_number(original)) # Due to random sampling, one original image might be used to generate multiple augmentations. So we need to index them in the file name.
+fname <- function(x) {
+  x <- strsplit(x, '.', fixed=TRUE)[[1]][1]
+  x <- rev(strsplit(x, "/", fixed=TRUE)[[1]])[1]
+  return(x)
+}
+new_fpath <- list()
+for (i in 1:need_count) {
+  new_fname <- paste0(fname(df$original[i]), "_augmentation", df$n[i], ".jpeg")
+  new_fpath[[i]] <- paste0("train/NORMAL/", new_fname)
+  image_write(train_images_augmented[[i]], path=paste0(output_dir, "/", new_fname), format="jpeg")
+}
+
+# bookkeeping for all augmented images
+df$file_path <- unlist(new_fpath)
+df_save <- df[,c("file_path", "original", "augment_type")]
+colnames(df_save)[2] <- "original_image"
+write.csv(df_save, "../chest_xray_resized_new_2/augmented_file_paths.csv", row.names = FALSE)
+
+# save the entire (augmented) dataset as an RDS file
+train_n <- length(train_images)
+for (i in 1:need_count) {
+  train_images[[train_n + i]] <- as.integer(image_data(train_images_augmented[[i]]))
+  train_labels[[train_n + i]] <- 0
+}
+saveRDS(list(
+  train_images = train_images,
+  train_labels = train_labels,
+  val_images = val_images,
+  val_labels = val_labels,
+  test_images = test_images,
+  test_labels = test_labels
+), "../chest_xray_resized_new_2/balanced_data_for_training.rds")
+```
+
+```{r}
+# An example of rotated image
+set.seed(123)
+rotate_df <- df[df$augment_type == "rotate",]
+rotate_sample <- rotate_df[sample(1:nrow(rotate_df), 1),]
+img1 <- image_read(rotate_sample$original[1])
+img2 <- image_read(paste0(output_dir, "/", fname(rotate_sample$original[1]), "_augmentation", rotate_sample$n[1], ".jpeg"))
+combined <- image_append(c(img1, img2), stack = FALSE)
+plot(combined)
+```
+
+```{r}
+# An example of zoomed-in image
+set.seed(1234)
+zoom_in_df <- df[df$augment_type == "zoom_in",]
+zoom_in_sample <- zoom_in_df[sample(1:nrow(zoom_in_df), 1),]
+img1 <- image_read(zoom_in_sample$original[1])
+img2 <- image_read(paste0(output_dir, "/", fname(zoom_in_sample$original[1]), "_augmentation", zoom_in_sample$n[1], ".jpeg"))
+combined <- image_append(c(img1, img2), stack = FALSE)
+plot(combined)
+```
+
+```{r}
+# copy/paste all original image files to the new folder "chest_xray_resized_new_2"
+files_to_copy <- list.files("train/NORMAL", full.names = TRUE)
+file.copy(from = files_to_copy, to = "../chest_xray_resized_new_2/train/NORMAL", overwrite = FALSE)
+file.copy(from = "train/PNEUMONIA", 
+          to = "../chest_xray_resized_new_2/train", 
+          recursive = TRUE, 
+          copy.mode = TRUE)
+if (!dir.exists("../chest_xray_resized_new_2/val")) dir.create("../chest_xray_resized_new_2/val")
+file.copy(from = "val/PNEUMONIA", 
+          to = "../chest_xray_resized_new_2/val", 
+          recursive = TRUE, 
+          copy.mode = TRUE)
+file.copy(from = "val/NORMAL", 
+          to = "../chest_xray_resized_new_2/val", 
+          recursive = TRUE, 
+          copy.mode = TRUE)
+if (!dir.exists("../chest_xray_resized_new_2/test")) dir.create("../chest_xray_resized_new_2/test")
+file.copy(from = "test/PNEUMONIA", 
+          to = "../chest_xray_resized_new_2/test", 
+          recursive = TRUE, 
+          copy.mode = TRUE)
+file.copy(from = "test/NORMAL", 
+          to = "../chest_xray_resized_new_2/test", 
+          recursive = TRUE, 
+          copy.mode = TRUE)
+file.copy(from = "file_paths.csv",
+          to = "../chest_xray_resized_new_2/file_paths.csv",
+          copy.mode = TRUE)
+```
